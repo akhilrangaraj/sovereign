@@ -26,5 +26,5 @@ RUN apk --no-cache add openssl wget
 RUN wget -O /usr/local/bin/dumb-init https://github.com/Yelp/dumb-init/releases/download/v1.2.1/dumb-init_1.2.1_amd64
 RUN chmod +x /usr/local/bin/dumb-init
 COPY --from=builder /app/target/scala-2.12/sovereign-assembly-0.1.jar /app/sovereign-assembly-0.1.jar
-ENTRYPOINT ["/usr/local/bin/dumb-init", "--"]
+ENTRYPOINT ["/usr/local/bin/dumb-init", "--", "java", "-jar", "/app/sovereign-assembly-0.1.jar"]
 
