@@ -1,5 +1,6 @@
 package com.github.akhilrangaraj
 import java.io.{BufferedWriter, File, FileWriter}
+import java.util.Date
 
 import com.amazonaws.services.batch.model._
 import com.amazonaws.services.batch.{AWSBatch, AWSBatchClientBuilder}
@@ -18,6 +19,7 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments) {
   val purge = opt[String]()
   val status = opt[String]()
   val replay = opt[Boolean]()
+  val ask = opt[Boolean]()
   val help = opt[Boolean]()
   val queueName = trailArg[String](required=true)
   verify()
@@ -30,6 +32,7 @@ object sovereign {
     |Usage: sovereign [-k] [-p reason] [-s status] queueName
     |
     |-k Kill the instance with failures. Requires appropriate aws keys and permissions
+    |-a ask to retry all
     |-p Purge the queue with the specified message. Conflicts with -k or -s
     |-s Which status to look at. Must be one of ${JobStatus.values().mkString(",")}. Defaults to ${JobStatus.FAILED}
     |-h this message
@@ -60,10 +63,12 @@ object sovereign {
     */
   def replay(batch: AWSBatch, conf: Conf) : Unit = {
     val file = new File(s"retry.log")
+    val jobLog = new File(s"jobs.log")
     val bw = new BufferedWriter(new FileWriter(file,true))
+    val jl = new BufferedWriter(new FileWriter(jobLog, true))
     try {
       val replayedJobs = scala.io.Source.fromFile(file).mkString.split("\n")
-
+      val allJobs = scala.io.Source.fromFile(jobLog).mkString.split("\n")
 
       val jobs = listJobs(conf.queueName.getOrElse(""), batch, JobStatus.FAILED)
       val jobsToReplay = ListBuffer.empty[JobDetail]
@@ -73,18 +78,33 @@ object sovereign {
         describeJobsRequest.setJobs(ids.asJava)
         val jobDescriptions = batch.describeJobs(describeJobsRequest)
         for (job <- jobDescriptions.getJobs.asScala) {
-          var retry = false
-          if (job.getAttempts().asScala.length > 1 && !job.getJobName.endsWith("-replay")) {
-            for (attempt <- job.getAttempts().asScala) {
-              if (attempt.getContainer() != null && attempt.getContainer.getReason != null) {
-                if (attempt.getContainer.getReason.contains("DockerTimeoutError: Could not transition to created; timed out after waiting")) {
-                  //retry any job that had an attempt fail for docker timeout error, even if it failed ultimately for another reason.
-                  retry = true
+          if (!allJobs.contains(job.getJobId)) {
+            jl.write(s"${job.getJobId}\n")
+            jl.flush()
+            var retry = false
+            if (job.getAttempts().asScala.length > 1 && !replayedJobs.contains(job.getJobName)) {
+              if (!job.getJobName.endsWith("-replay")) {
+                for (attempt <- job.getAttempts().asScala) {
+                  if (attempt.getContainer() != null && attempt.getContainer.getReason != null) {
+                    if (attempt.getContainer.getReason.contains("DockerTimeoutError: Could not transition to created; timed out after waiting")) {
+                      //retry any job that had an attempt fail for docker timeout error, even if it failed ultimately for another reason.
+                      retry = true
+                    }
+                  }
                 }
+                if (!retry && conf.ask.supplied) {
+                  val jobId = job.getJobId
+                  val stoppedAtDate = new Date(job.getStoppedAt)
+                  Console.println(s"Restart job ${jobId} from ${stoppedAtDate}- ${job.getStatusReason}? (y/n)")
+                  val input = scala.io.StdIn.readLine()
+                  if (input == "y") retry = true else bw.write(s"${job.getJobName}\n")
+                }
+              } else {
+                Console.println(s"Job: ${job.getJobId} - ${job.getJobName} failed on retry!")
               }
             }
+            if (retry) jobsToReplay += job
           }
-          if (retry) jobsToReplay += job
         }
       }
       jobsToReplay.map(j => {
@@ -101,6 +121,7 @@ object sovereign {
           request.setContainerOverrides(overrides)
           request.setRetryStrategy(j.getRetryStrategy)
           Console.println(s"Resubmitting ${j.getJobName}")
+          Thread.sleep(30000)
           batch.submitJob(request)
           bw.write(s"${j.getJobName}\n")
           bw.flush()
@@ -109,6 +130,8 @@ object sovereign {
     } finally {
       bw.flush()
       bw.close()
+      jl.flush()
+      jl.close()
     }
   }
   def kill(batch: AWSBatch, conf: Conf) : Unit =  {
